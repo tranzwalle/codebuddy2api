@@ -27,6 +27,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -208,6 +209,317 @@ DEFAULT_MODELS = [
     "minimax-m3-pay", "hy3-preview-agent", "auto",
 ]
 
+KIMI_REGISTRY_PROVIDER_ID = "codebuddy"
+KIMI_REGISTRY_PROVIDER_NAME = "CodeBuddy (local)"
+
+# Kimi Code custom registry 的可选展示名
+MODEL_DISPLAY_NAMES = {
+    "glm-5.2": "GLM 5.2",
+    "glm-5.1": "GLM 5.1",
+    "glm-5v-turbo": "GLM 5V Turbo",
+    "kimi-k2.7": "Kimi K2.7",
+    "kimi-k2.6": "Kimi K2.6",
+    "kimi-k2.5": "Kimi K2.5",
+    "deepseek-v4-pro": "DeepSeek V4 Pro",
+    "deepseek-v4-flash": "DeepSeek V4 Flash",
+    "minimax-m3-pay": "MiniMax M3 Pay",
+    "hy3-preview-agent": "HY3 Preview Agent",
+    "auto": "Auto",
+}
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+CODEBUDDY_CLI_MODELS_FILE = Path.home() / ".codebuddy" / "models.json"
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    id: str
+    name: str
+    tool_call: bool = True
+    reasoning: bool = False
+    support_efforts: tuple[str, ...] = ()
+    default_effort: str | None = None
+
+
+_MODEL_CACHE: dict = {"signature": None, "models": (), "source": "builtin"}
+
+
+def _default_model_specs() -> list[ModelSpec]:
+    return [
+        _finalize_model_spec(model_id, MODEL_DISPLAY_NAMES.get(model_id, model_id))
+        for model_id in DEFAULT_MODELS
+    ]
+
+
+def _coerce_str_list(value) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    out: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+    return tuple(out)
+
+
+def _infer_reasoning_fields(model_id: str) -> tuple[bool, tuple[str, ...], str | None]:
+    """为仅写了模型 ID 的条目推断 Kimi Code 思考模式元数据。"""
+    return True, ("low", "medium", "high"), "medium"
+
+
+def _finalize_model_spec(
+    model_id: str,
+    name: str,
+    *,
+    tool_call: bool = True,
+    reasoning: bool | None = None,
+    support_efforts: tuple[str, ...] | None = None,
+    default_effort: str | None = None,
+) -> ModelSpec:
+    inferred_reasoning, inferred_efforts, inferred_default = _infer_reasoning_fields(model_id)
+    final_reasoning = inferred_reasoning if reasoning is None else bool(reasoning)
+    final_efforts = inferred_efforts if support_efforts is None else support_efforts
+    final_default = inferred_default if default_effort is None else default_effort
+
+    if final_reasoning and not final_efforts:
+        final_efforts = inferred_efforts
+        if final_default is None:
+            final_default = inferred_default
+
+    if not final_reasoning and not final_efforts:
+        final_default = None
+
+    return ModelSpec(
+        id=model_id,
+        name=name,
+        tool_call=tool_call,
+        reasoning=final_reasoning,
+        support_efforts=final_efforts,
+        default_effort=final_default,
+    )
+
+
+def _model_spec_from_mapping(raw: dict, defaults: dict | None = None) -> ModelSpec | None:
+    defaults = defaults or {}
+    model_id = raw.get("id")
+    if not isinstance(model_id, str) or not model_id.strip():
+        return None
+    model_id = model_id.strip()
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        name = MODEL_DISPLAY_NAMES.get(model_id, model_id)
+
+    if "tool_call" in raw:
+        tool_call = bool(raw.get("tool_call"))
+    elif "supportsToolCall" in raw:
+        tool_call = bool(raw.get("supportsToolCall"))
+    else:
+        tool_call = bool(defaults.get("tool_call", defaults.get("supportsToolCall", True)))
+
+    reasoning = None
+    reasoning_explicit = False
+    for key in ("reasoning", "supportsReasoning"):
+        if key in raw:
+            reasoning = bool(raw.get(key))
+            reasoning_explicit = True
+            break
+    if reasoning is None:
+        for key in ("reasoning", "supportsReasoning"):
+            if key in defaults:
+                reasoning = bool(defaults.get(key))
+
+    support_efforts = None
+    for key in ("support_efforts", "supportEfforts"):
+        if key in raw:
+            support_efforts = _coerce_str_list(raw.get(key))
+            break
+    if support_efforts is None and not (reasoning_explicit and reasoning is False):
+        for key in ("support_efforts", "supportEfforts"):
+            if key in defaults:
+                support_efforts = _coerce_str_list(defaults.get(key))
+                break
+
+    default_effort = None
+    for key in ("default_effort", "defaultEffort"):
+        if key in raw:
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                default_effort = value.strip()
+            break
+    if default_effort is None and not (reasoning_explicit and reasoning is False):
+        for key in ("default_effort", "defaultEffort"):
+            if key in defaults:
+                value = defaults.get(key)
+                if isinstance(value, str) and value.strip():
+                    default_effort = value.strip()
+                break
+
+    if reasoning_explicit and reasoning is False:
+        support_efforts = support_efforts or ()
+        default_effort = None
+
+    return _finalize_model_spec(
+        model_id,
+        name.strip(),
+        tool_call=tool_call,
+        reasoning=reasoning,
+        support_efforts=support_efforts,
+        default_effort=default_effort,
+    )
+
+
+def _parse_models_payload(payload, defaults: dict | None = None) -> list[ModelSpec]:
+    if isinstance(payload, list):
+        specs: list[ModelSpec] = []
+        for item in payload:
+            if isinstance(item, str) and item.strip():
+                model_id = item.strip()
+                if defaults:
+                    spec = _model_spec_from_mapping({"id": model_id}, defaults)
+                else:
+                    spec = _finalize_model_spec(
+                        model_id,
+                        MODEL_DISPLAY_NAMES.get(model_id, model_id),
+                    )
+                if spec is not None:
+                    specs.append(spec)
+            elif isinstance(item, dict):
+                spec = _model_spec_from_mapping(item, defaults)
+                if spec is not None:
+                    specs.append(spec)
+        return _dedupe_model_specs(specs)
+
+    if not isinstance(payload, dict):
+        return []
+
+    defaults = dict(defaults or {})
+    if isinstance(payload.get("defaults"), dict):
+        defaults.update(payload["defaults"])
+
+    if isinstance(payload.get("models"), list):
+        by_id = {
+            spec.id: spec
+            for spec in _parse_models_payload(payload["models"], defaults)
+        }
+        available = payload.get("availableModels")
+        if isinstance(available, list) and available:
+            specs: list[ModelSpec] = []
+            for item in available:
+                if not isinstance(item, str) or not item.strip():
+                    continue
+                model_id = item.strip()
+                specs.append(by_id.get(model_id, _finalize_model_spec(
+                    model_id,
+                    MODEL_DISPLAY_NAMES.get(model_id, model_id),
+                )))
+            return _dedupe_model_specs(specs)
+        return _dedupe_model_specs(list(by_id.values()))
+
+    return []
+
+
+def _dedupe_model_specs(specs: list[ModelSpec]) -> list[ModelSpec]:
+    seen: set[str] = set()
+    out: list[ModelSpec] = []
+    for spec in specs:
+        if spec.id in seen:
+            continue
+        seen.add(spec.id)
+        out.append(spec)
+    return out
+
+
+def _load_models_file(path: Path) -> list[ModelSpec]:
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    specs = _parse_models_payload(payload)
+    if not specs:
+        raise ValueError(f"未在 {path} 中解析到任何模型")
+    return specs
+
+
+def _resolve_models_file_path(explicit: str | None = None) -> Path | None:
+    if explicit:
+        path = Path(explicit).expanduser()
+        return path if path.is_file() else None
+    env_path = os.environ.get("CODEBUDDY2OPENAI_MODELS_FILE", "").strip()
+    if env_path:
+        path = Path(env_path).expanduser()
+        return path if path.is_file() else None
+    local = PROJECT_ROOT / "models.json"
+    if local.is_file():
+        return local
+    if CODEBUDDY_CLI_MODELS_FILE.is_file():
+        return CODEBUDDY_CLI_MODELS_FILE
+    return None
+
+
+def _models_from_env() -> list[ModelSpec] | None:
+    raw = os.environ.get("CODEBUDDY2OPENAI_MODELS", "").strip()
+    if not raw:
+        return None
+    specs = [
+        _finalize_model_spec(model_id, MODEL_DISPLAY_NAMES.get(model_id, model_id))
+        for model_id in (part.strip() for part in raw.split(","))
+        if model_id
+    ]
+    return _dedupe_model_specs(specs) or None
+
+
+def _kimi_model_entry(spec: ModelSpec) -> dict:
+    entry = {
+        "id": spec.id,
+        "name": spec.name,
+        "tool_call": spec.tool_call,
+    }
+    if spec.support_efforts:
+        entry["support_efforts"] = list(spec.support_efforts)
+        if spec.default_effort:
+            entry["default_effort"] = spec.default_effort
+    elif spec.reasoning:
+        entry["reasoning"] = True
+    return entry
+
+
+def _models_cache_signature(path: Path | None) -> str:
+    if path is None:
+        return "builtin"
+    try:
+        st = path.stat()
+        return f"{path}:{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        return f"{path}:missing"
+
+
+def get_model_catalog(force_reload: bool = False) -> tuple[list[ModelSpec], str]:
+    """返回 (模型列表, 来源说明)。"""
+    env_specs = _models_from_env()
+    if env_specs is not None:
+        return env_specs, "env:CODEBUDDY2OPENAI_MODELS"
+
+    path = _resolve_models_file_path(CONFIG.get("models_file"))
+    signature = _models_cache_signature(path)
+    if (
+        not force_reload
+        and _MODEL_CACHE["signature"] == signature
+        and _MODEL_CACHE["models"]
+    ):
+        return list(_MODEL_CACHE["models"]), _MODEL_CACHE["source"]
+
+    if path is not None:
+        specs = _load_models_file(path)
+        if path == CODEBUDDY_CLI_MODELS_FILE:
+            source = f"file:{path} (CodeBuddy CLI)"
+        else:
+            source = f"file:{path}"
+    else:
+        specs = _default_model_specs()
+        source = "builtin:DEFAULT_MODELS"
+
+    _MODEL_CACHE["signature"] = signature
+    _MODEL_CACHE["models"] = tuple(specs)
+    _MODEL_CACHE["source"] = source
+    return specs, source
+
 # 后端请求体里出现过的额外字段（透传时若客户端给了就保留）
 PASSTHROUGH_BODY_KEYS = {
     "model", "messages", "tools", "tool_choice", "temperature",
@@ -223,7 +535,7 @@ PASSTHROUGH_BODY_KEYS = {
 
 app = FastAPI(title="codebuddy2openai", version="2.0")
 CONFIG: dict = {"api_key": "", "cred": None, "log_path": None,
-                "desensitize": False, "no_compact": False}  # cred: CredentialManager | None
+                "desensitize": False, "no_compact": False, "models_file": None}
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +579,29 @@ def _check_auth(authorization: Optional[str], x_api_key: Optional[str]):
         raise HTTPException(status_code=401, detail={"error": {"message": "invalid api key", "type": "auth_error"}})
 
 
+def _client_api_base_url(request: Request) -> str:
+    """Kimi Code registry 里 api 字段应指向本服务的 OpenAI 兼容根路径。"""
+    env = os.environ.get("CODEBUDDY2OPENAI_BASE_URL", "").strip()
+    if env:
+        return env.rstrip("/")
+    return f"{str(request.base_url).rstrip('/')}/v1"
+
+
+def _kimi_registry_payload(api_base_url: str) -> dict:
+    """生成 Kimi Code custom registry（api.json）文档。"""
+    specs, _ = get_model_catalog()
+    models = {spec.id: _kimi_model_entry(spec) for spec in specs}
+    return {
+        KIMI_REGISTRY_PROVIDER_ID: {
+            "id": KIMI_REGISTRY_PROVIDER_ID,
+            "name": KIMI_REGISTRY_PROVIDER_NAME,
+            "api": api_base_url,
+            "type": "openai",
+            "models": models,
+        }
+    }
+
+
 def _cred() -> CredentialManager:
     if CONFIG["cred"] is None:
         raise HTTPException(status_code=503, detail={"error": {"message": "未找到登录凭据，请先在桌面端登录 CodeBuddy/WorkBuddy", "type": "auth_error"}})
@@ -276,8 +611,10 @@ def _cred() -> CredentialManager:
 @app.get("/health")
 def health():
     cred = CONFIG["cred"]
+    specs, models_source = get_model_catalog()
     info: dict = {"status": "ok", "platform": sys.platform, "python": sys.version.split()[0],
-                  "auth_file": str(find_auth_file() or "(未找到)"), "mode": "direct-proxy (native function calling)"}
+                  "auth_file": str(find_auth_file() or "(未找到)"), "mode": "direct-proxy (native function calling)",
+                  "models_source": models_source, "model_count": len(specs)}
     if cred is not None:
         try:
             info["credential"] = cred.summary()
@@ -290,9 +627,20 @@ def health():
 def list_models(authorization: Optional[str] = Header(default=None),
                 x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     _check_auth(authorization, x_api_key)
-    data = [{"id": m, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
-            for m in DEFAULT_MODELS]
+    specs, _ = get_model_catalog()
+    data = [{"id": spec.id, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
+            for spec in specs]
     return {"object": "list", "data": data}
+
+
+@app.get("/api.json")
+@app.get("/v1/models/api.json")
+def kimi_registry(request: Request,
+                  authorization: Optional[str] = Header(default=None),
+                  x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    """Kimi Code custom registry（models.dev 形状的 api.json）。"""
+    _check_auth(authorization, x_api_key)
+    return _kimi_registry_payload(_client_api_base_url(request))
 
 
 @app.post("/v1/chat/completions")
@@ -898,11 +1246,14 @@ def main():
                          "保留原始 system prompt 完整内容（如 Claude Code 的行为指令），"
                          "但审核误拦风险略高于默认压缩模式。")
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
+    ap.add_argument("--models-file", default=None, metavar="PATH",
+                    help="模型列表配置文件（默认依次尝试 ./models.json、~/.codebuddy/models.json）")
     args = ap.parse_args()
 
     CONFIG["api_key"] = args.api_key
     CONFIG["desensitize"] = args.desensitize
     CONFIG["no_compact"] = args.no_compact
+    CONFIG["models_file"] = args.models_file
     # --log 直接指定文件路径即开启；不传则不记
     CONFIG["log_path"] = args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
     af = find_auth_file()
@@ -911,8 +1262,16 @@ def main():
     if not args.skip_check:
         preflight()
 
+    try:
+        specs, models_source = get_model_catalog(force_reload=True)
+    except Exception as e:
+        sys.stderr.write(f"[错误] 模型列表加载失败：{e}\n")
+        sys.exit(1)
+
     sys.stderr.write(f"\n✅ 监听 http://{args.host}:{args.port}（直连后端，原生 function calling）\n")
+    sys.stderr.write(f"   模型列表  : {len(specs)} 个（来源 {models_source}）\n")
     sys.stderr.write("   GET  /v1/models\n")
+    sys.stderr.write("   GET  /api.json                 (Kimi Code custom registry)\n")
     sys.stderr.write("   POST /v1/chat/completions   (原生 tools/tool_calls，支持流式)\n")
     sys.stderr.write("   POST /v1/responses          (Responses API，Codex CLI 兼容)\n")
     sys.stderr.write("   POST /v1/messages           (Anthropic API，Claude Code / CC Switch 兼容)\n")

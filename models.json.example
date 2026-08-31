@@ -1,0 +1,18 @@
+{
+  "defaults": {
+    "reasoning": true,
+    "support_efforts": ["low", "medium", "high"],
+    "default_effort": "medium"
+  },
+  "models": [
+    "glm-5.2",
+    "glm-5.3-flash",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    {
+      "id": "your-new-model-id",
+      "name": "Your New Model",
+      "tool_call": true
+    }
+  ]
+}
