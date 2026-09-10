@@ -15,7 +15,6 @@ ENV/
 # 本地运行产物 / 日志
 *.log
 converter.pid
-models.json
 .DS_Store
 Thumbs.db
 

@@ -1,0 +1,19 @@
+{
+  "defaults": {
+    "reasoning": true,
+    "support_efforts": ["low", "medium", "high"],
+    "default_effort": "high"
+  },
+  "models": [
+    "glm-5.3",
+    "glm-5.3-flash",
+    "glm-5.2",
+    "kimi-k3",
+    "kimi-k2.7",
+    "deepseek-v4-pro",
+    "deepseek-v4.1-flash",
+    "minimax-m3",
+    "hy4-preview",
+    "hy3"
+  ]
+}
